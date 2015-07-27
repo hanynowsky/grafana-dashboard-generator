@@ -20,7 +20,7 @@ import sys
 from os.path import expanduser
 import re
 import subprocess
-
+from requests.exceptions import ConnectionError
 ############# CONFIGURATION ###################
 FEX_LIST_URL = 'http://mycompany.com/my_cisco_fex_list'
 FEX_INTERFACE_PREFIX = "Ethernet"
@@ -783,6 +783,8 @@ def check_grafana_version():
 		r = requests.get(url, headers=headers, verify=False)
 		if re.search( r'(.*)[2-3]\.[0-9]\.[0-9]?(.*?).*', r.text, re.M|re.I) and re.search( r'(.*)version(.*?).*', r.text, re.M|re.I):
 			return True, r.json()
+	except ConnectionError as ce:
+                print("ConnectionError. Please check grafana URL")
 	except Exception as e:
 		print(traceback.format_exc())
 	return False
