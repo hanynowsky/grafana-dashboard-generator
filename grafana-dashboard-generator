@@ -1,0 +1,1004 @@
+!/usr/bin/env python
+
+# Author:	Hanine HAMZIOUI <hanynowsky@gmail.com>
+# Date: 	June 2015
+# Usage: 	Generate Grafana 2.0 JSON file for Network devices tracked in Graphite-API
+#		- Please check help
+# Requirements: python3
+
+# This is a basic script serving an internal need, which is to generate dashboards for some Cisco network devices.
+# These devices are graphed using SNMP. Metrics are sent to Graphite and then picked up by Grafana.
+# You can refactor this script to fit your needs or at least get inspired to write a generic program.
+
+import requests
+import json
+import traceback
+import time
+import os
+import getopt
+import sys
+from os.path import expanduser
+import re
+import subprocess
+
+############# CONFIGURATION ###################
+FEX_LIST_URL = 'http://mycompany.com/my_cisco_fex_list'
+FEX_INTERFACE_PREFIX = "Ethernet"
+FEX_NAME_PREFIX = "FEX-"
+GRAFANA_NETWORK_API_KEY = "kusgdflusdfygsdfg<dfygfxxmqsdysldfugfySQdqsdqsdsqfsdfsdfsdfsqd!"
+GRAFANA_API_KEY = ""
+GRAFANA_TARGET_SERVER = ""
+GRAFANA_HOSTING_API_KEY = ""
+GRAFANA_NETWORK_SERVER = "server19390.mycomp.net"
+GRAFANA_NETWORK_SERVER_URL = "http://" + GRAFANA_NETWORK_SERVER
+GRAFANA_HOSTING_SERVER_URL = "http://server34565.mycomp.net"
+GRAFANA_NETWORK_SEARCH_URL = GRAFANA_NETWORK_SERVER_URL + "/api/search?query="
+GRAFANA_NETWORK_DELETE_URL = GRAFANA_NETWORK_SERVER_URL + "/api/dashboards/db"
+GRAFANA_PORT = "3000"
+GRAFANA_VERSION = '2.0.1'
+GRAPHITE_NETWORK_SERVER_URL = "http://graphitenet.mycomp.net"
+GRAPHITE_HOSTING_SERVER_URL = "http://graphite.mycomp.net"
+GRAPHITE_PORT = "8001"
+GRAPHITE_PREFIX = "projectx"
+GRAPHITE_NETWORK_SERVER_SURL = GRAPHITE_NETWORK_SERVER_URL + ":" + GRAPHITE_PORT + "/metrics/expand?query=" + GRAPHITE_PREFIX + "."
+GRAPHITE_HOSTING_SERVER_SURL = GRAPHITE_HOSTING_SERVER_URL + ":" + GRAPHITE_PORT + "/metrics/expand?query=collectd."
+GRAPHITE_URL_SEARCH_PATTERN = "mycompdomain" # OPTIONAL
+DO_DEVICE_DELETE = False
+SEARCH_KEYWORD = ""
+GRAPHITE_REGEX = ""
+DEBUG = True
+SYNC = False
+FILTER_ROUTER_INTERFACES = True
+CRITICAL_DC = "dc22"
+SWITCH_EXAMPLE = "switch920.network.mycomp.net"
+SDSL_EXAMPLE = "yohan@sdsl.alink.22.30.110.10"
+ROUTER_EXAMPLE = "r3.dc21.network.mycomp.net"
+class Colors:
+	HEADER = '\033[95m'
+	BLUE = '\033[94m'
+	GREEN = '\033[92m'
+	WARNING = '\033[93m'
+	FAIL = '\033[91m'
+	ENDC = '\033[0m'
+	BOLD = '\033[1m'
+	UNDERLINE = '\033[4m'
+########################################
+
+def set_config_values(GRAFANA_API_KEY_V, GRAFANA_TARGET_SERVER_V, SYNC_BOOLEAN):
+	if GRAFANA_API_KEY_V == "" or GRAFANA_API_KEY_V is None:
+		global GRAFANA_API_KEY
+		GRAFANA_API_KEY = GRAFANA_NETWORK_API_KEY
+		if DEBUG == True:
+			print(Colors.BLUE + "Using default API key: Network Api Key " + GRAFANA_API_KEY + " on " + GRAFANA_NETWORK_SERVER_URL + Colors.ENDC)
+	
+	if GRAFANA_TARGET_SERVER_V == "" or GRAFANA_TARGET_SERVER_V is None:
+		global GRAFANA_TARGET_SERVER
+		GRAFANA_TARGET_SERVER = GRAFANA_NETWORK_SERVER_URL
+		if DEBUG == True:
+			print(Colors.BLUE + "Using default Grafana Server: Network " + GRAFANA_NETWORK_SERVER_URL + Colors.ENDC)
+	if SYNC_BOOLEAN is None:
+		global SYNC
+		SYNC = False
+
+def search_graphite(regex):
+	""" Search Graphite with a regex  """
+	if DEBUG == True:
+		print("Searching Graphite with: " + regex)
+	url = GRAPHITE_NETWORK_SERVER_SURL + regex
+	r = requests.get(url, data=None, verify=False)
+	if r.status_code == requests.codes.ok:
+		data = r.json()
+		result_list = data['results']
+	else:
+		print(Colors.FAIL + " Problem searching graphite " + str(r.status.code) + Colors.ENDC)
+		pass
+	list = []
+	for e in result_list:
+		list.append(e.replace("\"",""))
+	return list
+
+def get_device_list(device_type):
+	""" List of devices as JSON """
+	if not device_type == "" and device_type is not None:
+		if device_type == "sdsl":
+			url = GRAPHITE_NETWORK_SERVER_SURL + device_type + ".*[0-9]"
+		else:
+			url = GRAPHITE_NETWORK_SERVER_SURL + device_type + ".*(_|" + GRAPHITE_URL_SEARCH_PATTERN + ")*"
+		r = requests.get(url, data=None, verify=False)
+		if r.status_code == requests.codes.ok:
+			data = r.json()
+			device_list = data['results']
+		else:
+			pass
+		list = []
+		for e in device_list:
+			list.append(e.replace(GRAPHITE_PREFIX + "." + device_type + ".",""))
+		return list
+	else:
+		return ["Device type: " + device_type + "Not supported!"]
+
+def fex_port_translator(fex, portstring):
+	""" Ethernet123/1/3 = FEX-123 linked to router port 3 """
+	portlist = portstring.split(',')
+	string = ""
+	for e in portlist:
+		string += FEX_INTERFACE_PREFIX + str(fex.replace(FEX_NAME_PREFIX,"")) + "/1/" + str(e)  + ","
+	return string 
+
+def get_routerfexes_list():
+	""" List of Fexes along with their routers and ports as string """
+	url = FEX_LIST_URL 
+	r = requests.get(url, verify=False)
+	if r.status_code == requests.codes.ok:
+		b = r.text
+		data = r.json()
+	else:
+		print(r.status_code)
+		b = ''
+	list = json.loads(b)
+	return data
+
+def get_fexrouters_list():
+	""" List of Fexes along with their routers and ports as string. """ 
+	"""Ports translated to corresponding interfaces """
+	routerlist = []
+	e = {}
+	for fexrouter in get_routerfexes_list():
+		e = {'fex':fexrouter['fex'],'ip':fexrouter['routeur_ip'], 'community':fexrouter['routeur_communaute'], 'hostname':fexrouter['routeur_hostname'], "interfaces": fex_port_translator(fexrouter['fex'],fexrouter['ports'])}
+		routerlist.append(e)
+
+	seen = set()
+	new_l = []
+	for d in routerlist:
+		t = tuple(d.items())
+		if t not in seen:
+			seen.add(t)
+			new_l.append(d)
+	return new_l
+
+def get_fex_router(fex):
+	""" Get the router linked to a given FEX"""
+	router = None
+	for f in get_fexrouters_list():
+		if f['fex'] == fex:
+			router = f['hostname']
+			break
+	return router
+
+def get_router_fex(router):
+	""" Returns a list of FEXes linked to a router"""
+	fex = []
+	router = router.replace("_",".")
+	for f in get_fexrouters_list():
+		if f['hostname'] == router:
+			fex.append(f['fex'])
+	return fex
+
+def get_fexes():
+	""" List of FEXes names"""
+	fexes = []
+	for f in get_fexrouters_list():
+		fexes.append(f['fex'])
+	return fexes
+
+def get_fex_router_interfaces(fex):
+	"""  Returns, for a given FEx name, the linked router and the list of interfaces's names"""
+	interfaces = []
+	router = None
+	for f in get_fexrouters_list():
+		if f['fex'] == str(fex):
+			interfaces = list(f['interfaces'].split(','))			
+			router = f['hostname']
+			break
+	for index, e in enumerate(interfaces):
+		if e is None or e == "":
+			interfaces.pop(index)
+	return router, interfaces
+
+def is_interface_graphed(device, interface, device_type):
+	""" Checks whether an interface has been graphing at least once in a week  """
+	""" This function is only suited for Routers as they generate big dashboards that fail onto grafana API"""
+	""" If you want to apply that rule to all network equipment set FILTER_ROUTER_INTERFACES to False"""
+	data_list = []
+	url = GRAPHITE_NETWORK_SERVER_URL + ":" + GRAPHITE_PORT + "/render?target="+GRAPHITE_PREFIX+".%s.%s.%s.ifHCInOctets&format=json&from=-7d" % (device_type, device,interface.replace("/","_"))
+	r = requests.get(url, data=None, verify=False)
+	is_graphed = False
+	result = None
+	try:
+		if r.status_code == requests.codes.ok:
+			data = r.json()
+			target = data[0]['target']
+			datapoints = data[0]['datapoints']
+			result = 0
+			for datum in datapoints:
+				if datum[0] is not None:
+					result += float(datum[0])
+			if result > 0:
+				is_graphed = True
+		else:
+			return False, 0
+	except IndexError as e:
+		""" print("Index Error for: " + device + "  " + interface)
+		print(e) """
+		pass
+	return is_graphed, result
+
+def get_device_interfaces(device, device_type):
+	""" List of Network interfaces for a given Network Device """
+	url = GRAPHITE_NETWORK_SERVER_SURL + device_type + '.' + device + '.*'
+	r = requests.get(url, data=None, verify=False)
+	if r.status_code == requests.codes.ok:
+		data = r.json()
+		device_interfaces = data['results']
+	device_ifs = []
+	for interface in device_interfaces:
+		interface = interface.replace(GRAPHITE_PREFIX + "." + device_type + "." + device + ".", "")
+		regexp = re.compile(r'[pP]ort-[cC]hannel[0-9].*?')
+		regexp1 = re.compile(r'.*thernet.*?')
+		regexp2 = re.compile(r'Vlan.*?')
+		is_rkw = False
+		is_skw = False
+		if regexp.search(str(interface)) is not None or regexp1.search(str(interface)) is not None or regexp2.search(str(interface)) is not None:
+			is_rkw = True
+		if is_rkw and "unrouted" not in str(interface):
+			if (device_type == "router" or device_type == "fexrouter") and FILTER_ROUTER_INTERFACES:
+				bool, count = is_interface_graphed(device, interface, device_type)
+				if bool:
+					device_ifs.append(interface)
+			else:
+				device_ifs.append(interface)
+	else:
+		pass
+	return device_ifs
+
+def get_device_interfaces_dict(device_type):
+	""" Feed a dictionary with Interfaces for each Device """
+	device_dictionary = {}
+	for device in get_device_list(device_type):
+		if_list = []
+		for interface in get_device_interfaces(device, device_type):
+			if_list.append(interface)
+		device_dictionary[device] = if_list
+	for k in device_dictionary:
+		print(device_dictionary[k])
+	return device_dictionary
+
+def generate_grafana_json_block(device_type, interface_name, main_title, graph_id):
+	""" main_title = hostname where dots are underscored. e.g sw90_myinfra.net
+	# device_type:  switch | router | sdsl | server | fexrouter
+	# interface_name: e.g GigabitEthernet0_12 """
+	interface_name = interface_name.replace("/","_")
+	main_title = main_title.replace(".","_")
+	if device_type == 'fex':
+		device_type = 'fexrouter'
+	metric_query = "scale(perSecond(" + GRAPHITE_PREFIX + ".%s.%s.%s.*), 8)" %(device_type, main_title, interface_name)
+	block = '''{
+          "aliasColors": {},
+          "bars": false,
+          "datasource": null,
+          "editable": true,
+          "error": false,
+          "fill": 1,
+          "grid": {
+            "leftLogBase": 1,
+            "leftMax": null,
+            "leftMin": null,
+            "rightLogBase": 1,
+            "rightMax": null,
+            "rightMin": null,
+            "threshold1": null,
+            "threshold1Color": "rgba(216, 200, 27, 0.27)",
+            "threshold2": null,
+            "threshold2Color": "rgba(234, 112, 112, 0.22)",
+            "thresholdLine": false
+          },
+          "id": %(graph_id)d,
+          "leftYAxisLabel": "",
+          "legend": {
+            "alignAsTable": true,
+            "avg": true,
+            "current": true,
+            "hideEmpty": false,
+            "max": true,
+            "min": true,
+            "rightSide": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "percentage": false,
+          "pointradius": 1,
+          "points": true,
+          "renderer": "flot",
+          "rightYAxisLabel": "",
+          "seriesOverrides": [],
+          "span": 12,
+          "stack": false,
+          "steppedLine": false,
+          "targets": [
+            {
+              "target": "%(metric_query)s"
+            }
+          ],
+          "timeFrom": null,
+          "timeShift": null,
+          "title": "%(interface_name)s",
+          "tooltip": {
+            "shared": true,
+            "value_type": "cumulative"
+          },
+          "transparent": true,
+          "type": "graph",
+          "x-axis": true,
+          "y-axis": true,
+          "y_formats": [
+            "bits",
+            "short"
+          ]
+        }	
+''' % {'title': main_title, 'global_title': main_title, 'interface_name': interface_name, 'metric_query': metric_query, 'graph_id': graph_id}
+	return block
+
+def append_grafana_json_blocks(device, device_type):
+	"""
+	Generate a Graph for each network interface
+	"""
+	blocks = ""
+	graph_id = 1
+	if device_type == "fexrouter":
+		device = device.upper()
+		if FEX_NAME_PREFIX not in device:
+			print(str(device) + " is not of format FEX-XXX")
+			exit()
+		fexrouter, fexinterfaces = get_fex_router_interfaces(device)
+		for index, interface_name in enumerate(fexinterfaces):	
+			if index == len(fexinterfaces) - 1:
+				blocks += str(generate_grafana_json_block(device_type, interface_name, fexrouter.replace(".","_"),graph_id))
+			else:
+				blocks += str(generate_grafana_json_block(device_type, interface_name, fexrouter.replace(".","_"),graph_id)) + ","
+			graph_id = graph_id + 1
+	else:			
+		for index, interface_name in enumerate(get_device_interfaces(device, device_type)):
+			if index == len(get_device_interfaces(device, device_type)) - 1:
+				blocks += str(generate_grafana_json_block(device_type, interface_name, device.replace(".","_"),graph_id))
+			else:
+				blocks += str(generate_grafana_json_block(device_type, interface_name, device.replace(".","_"), graph_id)) + ","
+			graph_id = graph_id + 1
+	return blocks
+
+def generate_grafana_dashboard_list(device_type):
+	""" Generate Dashboard List for a device type """
+	if device_type == 'fexrouter':
+		device_type = 'fex'
+	title = device_type.title()
+	file = ''' {"dashboard":
+{
+  "id": null,
+  "title": "%(title)s Dashboards",
+  "originalTitle": "%(title)s Dashboards",
+  "tags": [],
+  "style": "dark",
+  "timezone": "browser",
+  "editable": true,
+  "hideControls": false,
+  "sharedCrosshair": false,
+  "rows": [
+    {
+      "collapse": false,
+      "editable": true,
+      "height": "250px",
+      "panels": [
+        {
+          "editable": true,
+          "error": false,
+          "id": null,
+          "limit": 530,
+          "links": [],
+          "mode": "search",
+          "query": "",
+          "span": 12,
+          "tag": "%(device_type)s",
+          "title": "%(title)s Dashboards",
+          "type": "dashlist"
+        }
+      ],
+      "title": "Row"
+    }
+  ],
+  "nav": [
+    {
+      "collapse": false,
+      "enable": true,
+      "notice": false,
+      "now": true,
+      "refresh_intervals": [
+        "5s",
+        "10s",
+        "30s",
+        "1m",
+        "5m",
+        "15m",
+        "30m",
+        "1h",
+        "2h",
+        "1d"
+      ],
+      "status": "Stable",
+      "time_options": [
+        "5m",
+        "15m",
+        "1h",
+        "6h",
+        "12h",
+        "24h",
+        "2d",
+        "7d",
+        "30d"
+      ],
+      "type": "timepicker"
+    }
+  ],
+  "time": {
+    "from": "now-12h",
+    "to": "now"
+  },
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": []
+  },
+  "schemaVersion": 6,
+  "version": 2
+},"overwrite":true}
+''' % {'device_type': device_type, 'title': title}
+	return file
+
+def generate_grafana_json_file(device, device_type, sync):
+	""" Generate Grafana JSON data """
+	main_title = device.replace("_","-")
+	if device_type == "fexrouter":
+		main_title = main_title.upper()
+	blocks = append_grafana_json_blocks(device, device_type)
+	file = ''' {"dashboard":
+{
+  "id": null,
+  "title": "%(main_title)s",
+  "originalTitle": "%(main_title)s",
+  "tags": ["%(device_type)s"],
+  "style": "dark",
+  "timezone": "browser",
+  "editable": true,
+  "hideControls": false,
+  "sharedCrosshair": false,
+  "rows": [
+    {
+      "collapse": false,
+      "editable": true,
+      "height": "350px",
+      "panels": [
+		%(blocks)s
+      ],
+      "title": "Row"
+    }
+  ],
+  "nav": [
+    {
+      "collapse": false,
+      "enable": true,
+      "notice": false,
+      "now": true,
+      "refresh_intervals": [
+        "5s",
+        "10s",
+        "30s",
+        "1m",
+        "5m",
+        "15m",
+        "30m",
+        "1h",
+        "2h",
+        "1d"
+      ],
+      "status": "Stable",
+      "time_options": [
+        "5m",
+        "15m",
+        "1h",
+        "6h",
+        "12h",
+        "24h",
+        "2d",
+        "7d",
+        "30d"
+      ],
+      "type": "timepicker"
+    }
+  ],
+  "time": {
+    "from": "now-12h",
+    "to": "now"
+  },
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": []
+  },
+  "refresh": "5m",
+  "schemaVersion": 6,
+  "version": 10
+}
+,"overwrite":true}
+''' % {'device_type': device_type, 'main_title': main_title, 'blocks': blocks}
+	try:
+		home = expanduser("~")
+		timestamp = int(time.time())
+		filepath = str(home) + "/dashboards/"
+		if not os.path.exists(filepath):
+			os.makedirs(filepath)
+		with open("{}".format(home) + "/dashboards/{}".format(main_title) + ".json", "w") as dashboard:
+			if sync:
+				dashboard.write(file.replace(',"overwrite":true}','').replace('{"dashboard":',''))
+				subprocess.call(["rsync", "-avrz" , filepath + main_title + ".json", "root@" + GRAFANA_NETWORK_SERVER + ":/usr/share/grafana/public/dashboards/"])
+				print("File transferred to Grafana server " + GRAFANA_NETWORK_SERVER)
+				print("Public Dashboard: " + GRAFANA_NETWORK_SERVER_URL + ":"+ GRAFANA_PORT +"/dashboard/file/" +main_title + ".json")
+			else:
+				dashboard.write(file)
+		print("File written to: " + filepath + main_title + ".json")
+	except:
+		print(traceback.format_exc())
+	return file
+
+##################
+
+def generate_grafana_json_sum_file(device, device_type):
+	""" Generate Grafana JSON data synthetic file"""
+	""" This function is intended for Special routers with so many interfaces """
+	"""   Grafana 2.0 - due to an APi bug - cannot handle some large json files """
+	main_title = device.replace("_","-")
+	file = ''' {"dashboard":
+{
+  "id": null,
+  "title": "%(main_title)s",
+  "originalTitle": "%(main_title)s",
+  "tags": ["%(device_type)s"],
+  "style": "dark",
+  "timezone": "browser",
+  "editable": true,
+  "hideControls": false,
+  "sharedCrosshair": false,
+  "rows": [
+    {
+      "collapse": false,
+      "editable": true,
+      "height": "250px",
+      "panels": [
+        {
+          "title": "In",
+          "error": false,
+          "span": 12,
+          "editable": true,
+          "type": "graph",
+          "id": 1,
+          "datasource": null,
+          "renderer": "flot",
+          "x-axis": true,
+          "y-axis": true,
+          "y_formats": [
+            "bits",
+            "short"
+          ],
+          "grid": {
+            "leftLogBase": 1,
+            "leftMax": null,
+            "rightMax": null,
+            "leftMin": null,
+            "rightMin": null,
+            "rightLogBase": 1,
+            "threshold1": null,
+            "threshold2": null,
+            "threshold1Color": "rgba(216, 200, 27, 0.27)",
+            "threshold2Color": "rgba(234, 112, 112, 0.22)"
+          },
+          "lines": true,
+          "fill": 1,
+          "linewidth": 1,
+          "points": true,
+          "pointradius": 1,
+          "bars": false,
+          "stack": false,
+          "percentage": false,
+          "legend": {
+            "show": true,
+            "values": true,
+            "min": true,
+            "max": true,
+            "current": true,
+            "total": true,
+            "avg": true,
+            "hideEmpty": true,
+            "alignAsTable": true
+          },
+          "nullPointMode": "null",
+          "steppedLine": false,
+          "tooltip": {
+            "value_type": "cumulative",
+            "shared": true
+          },
+          "timeFrom": null,
+          "timeShift": null,
+          "targets": [
+            {
+              "target": "scale(perSecond(%(graphite_prefix)s.%(device_type)s.%(device)s.*.ifHCInOctets), 8)"
+            }
+          ],
+          "aliasColors": {},
+          "seriesOverrides": [],
+          "links": [],
+          "transparent": true
+        },
+        {
+          "title": "Out",
+          "error": false,
+          "span": 12,
+          "editable": true,
+          "type": "graph",
+          "id": 2,
+          "datasource": null,
+          "renderer": "flot",
+          "x-axis": true,
+          "y-axis": true,
+          "y_formats": [
+            "bits",
+            "short"
+          ],
+          "grid": {
+            "leftLogBase": 1,
+            "leftMax": null,
+            "rightMax": null,
+            "leftMin": null,
+            "rightMin": null,
+            "rightLogBase": 1,
+            "threshold1": null,
+            "threshold2": null,
+            "threshold1Color": "rgba(216, 200, 27, 0.27)",
+            "threshold2Color": "rgba(234, 112, 112, 0.22)"
+          },
+          "lines": true,
+          "fill": 1,
+          "linewidth": 1,
+          "points": true,
+          "pointradius": 1,
+          "bars": false,
+          "stack": false,
+          "percentage": false,
+          "legend": {
+            "show": true,
+            "values": true,
+            "min": true,
+            "max": true,
+            "current": true,
+            "total": true,
+            "avg": true,
+            "hideEmpty": true,
+            "alignAsTable": true
+          },
+          "nullPointMode": "null",
+          "steppedLine": false,
+          "tooltip": {
+            "value_type": "cumulative",
+            "shared": true
+          },
+          "timeFrom": null,
+          "timeShift": null,
+          "targets": [
+            {
+              "target": "scale(perSecond(%(graphite_prefix)s.%(device_type)s.%(device)s.*.ifHCOutOctets), 8)"
+            }
+          ],
+          "aliasColors": {},
+          "seriesOverrides": [],
+          "links": [],
+          "transparent": true
+        }
+      ],
+      "title": "Row"
+    }
+  ],
+  "nav": [
+    {
+      "collapse": false,
+      "enable": true,
+      "notice": false,
+      "now": true,
+      "refresh_intervals": [
+        "5s",
+        "10s",
+        "30s",
+        "1m",
+        "5m",
+        "15m",
+        "30m",
+        "1h",
+        "2h",
+        "1d"
+      ],
+      "status": "Stable",
+      "time_options": [
+        "5m",
+        "15m",
+        "1h",
+        "6h",
+        "12h",
+        "24h",
+        "2d",
+        "7d",
+        "30d"
+      ],
+      "type": "timepicker"
+    }
+  ],
+  "time": {
+    "from": "now-12h",
+    "to": "now"
+  },
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": []
+  },
+  "refresh": "5m",
+  "schemaVersion": 6,
+  "version": 8
+}
+,"overwrite":true}
+''' % {'device': device, 'device_type': device_type, 'main_title': main_title, 'graphite_prefix': GRAPHITE_PREFIX}
+	try:
+		home = expanduser("~")
+		timestamp = int(time.time())
+		filepath = str(home) + "/dashboards/"
+		if not os.path.exists(filepath):
+			os.makedirs(filepath)
+		with open("{}".format(home) + "/dashboards/{}".format(timestamp) + "_dashboard.json", "w") as dashboard:
+			dashboard.write(file)
+		print("File written to: " + filepath)
+	except:
+		print(traceback.format_exc())
+	return file
+
+##################
+
+
+def check_grafana_version():
+	""" Check Grafana Version """
+	url = GRAFANA_TARGET_SERVER + ":" + GRAFANA_PORT + "/api/frontend/settings"
+	headers = {'Authorization': "Bearer " + GRAFANA_API_KEY}
+	try:
+		r = requests.get(url, headers=headers, verify=False)
+		if re.search( r'(.*)[2-3]\.[0-9]\.[0-9]?(.*?).*', r.text, re.M|re.I) and re.search( r'(.*)version(.*?).*', r.text, re.M|re.I):
+			return True, r.json()
+	except Exception as e:
+		print(traceback.format_exc())
+	return False
+
+
+def post_grafana_file(json_data):
+	""" Post a json dashboard file to Grafana DB """
+	url = GRAFANA_TARGET_SERVER + ":" + GRAFANA_PORT + "/api/dashboards/db/"
+	headers = {'Authorization': "Bearer " + GRAFANA_API_KEY, 'content-type': 'application/json'}
+	try:
+		r = requests.post(url, headers=headers, data=json_data, verify=False)
+		return r.json()
+	except Exception as e:
+		print(traceback.format_exc())
+	return 1
+
+def is_hostname_graphed(device_type, hostname):
+	""" Check whether a hostname is tracked by Graphite-API """
+	if not device_type == "" and device_type is not None:
+		if hostname is not None:
+			hostname = hostname.replace("@","_at_")
+			url = GRAPHITE_NETWORK_SERVER_SURL + device_type + "." + hostname.replace(".","_") + ""
+		r = requests.get(url, data=None, verify=False)
+		if r.status_code == requests.codes.ok:
+			data = r.json()
+			device_list = data['results']
+		else:
+			pass
+		list = []
+		for e in device_list:
+			list.append(e.replace(GRAPHITE_PREFIX + "." + device_type + ".",""))
+		return len(list) > 0
+	else:
+		return False
+
+def post_dashboards_to_grafana(device_type, device_hostname, sync):
+	""" Post Dashboards onto Grafana DB for all devices tracked in Graphite-API """
+	if check_grafana_version():
+		try:
+			if device_hostname is not "":
+				if device_type == 'fexrouter':
+					fex_name = device_hostname
+					device_hostname = get_fex_router(device_hostname.upper())
+				device_hostname = device_hostname.replace(".","_")
+				device_hostname = device_hostname.replace("@","_at")
+				if is_hostname_graphed(device_type, device_hostname):
+					device_list = [str(device_hostname)]
+					if device_type == 'fexrouter':
+						device_list = [str(fex_name)]
+				else:
+					print(Colors.FAIL + device_hostname + " is not graphed yet in Graphite-API. Or you mispelled it!" + Colors.ENDC)
+					return 1
+			else:
+				if device_type == 'fexrouter':
+					device_list = get_fexes()
+				else:
+					device_list = get_device_list(device_type)
+			for device in device_list:
+				if CRITICAL_DC in device:
+					json_data = generate_grafana_json_sum_file(device, device_type)
+				else:
+					json_data = generate_grafana_json_file(device, device_type, sync)
+				result = post_grafana_file(json_data)
+				print(result)
+				#print(device)
+			dashboard_list_json = generate_grafana_dashboard_list(device_type)
+			outcome = post_grafana_file(dashboard_list_json)
+			print(outcome)
+		except:
+			print(traceback.format_exc())
+
+def delete_dashboards(keyword):
+	"""  Delete Dashboards based on a search keyword"""
+	if not GRAPHITE_PREFIX + "test" in keyword:
+		headers = {'Authorization': "Bearer " + GRAFANA_API_KEY, 'content-type': 'application/json'}
+		for slug in search_dashboards(keyword):
+			url = GRAFANA_NETWORK_DELETE_URL + "/" + slug + ""
+			if slug not in GRAPHITE_PREFIX+"test" and not slug in "new-dashboard" and not slug in "templated-graphs-nested":
+				r = requests.delete(url, data=None, headers=headers, verify=False)
+				if r.status_code == requests.codes.ok:
+					data = r.json()
+					print(data)
+				else:
+					print(Colors.FAIL + "Problem deleting SLUG " + slug + Colors.ENDC)
+					pass
+	else:
+		print(Colors.FAIL + "Forbidden keyword" + Colors.ENDC)
+
+def search_dashboards(keyword):
+	""" Search Dashboards slugs based on keyword """
+	if not keyword in GRAPHITE_PREFIX.capitalize() +"Test":
+		headers = {'Authorization': "Bearer " + GRAFANA_API_KEY, 'content-type': 'application/json'}
+		url = GRAFANA_NETWORK_SEARCH_URL + keyword + "&starred=false&tag="
+		r = requests.get(url, data=None, headers=headers, verify=False)
+		slugs = []
+		if r.status_code == requests.codes.ok:
+			data = r.json()
+			slugs = data['dashboards']
+		else:
+			print(Colors.FAIL + "Problem fetching SLUGS" + Colors.ENDC)
+			print(Colors.FAIL + url + " - key: " + GRAFANA_API_KEY  + Colors.ENDC)
+			pass
+		list = []
+		for e in slugs:
+			list.append(e['slug'].replace("",""))
+		return list
+
+def usage():
+	""" USAGE definition """
+	script = os.path.basename(__file__)
+	print(Colors.GREEN + Colors.BOLD + "Grafana Dashboard Generator for " + GRAPHITE_PREFIX.upper() + " 2.0.2\n" + Colors.ENDC)
+	print(Colors.HEADER + "USAGE:" + Colors.ENDC + "$~ " + script + " --switch|--router|--fexrouter|--server|--sdsl|--xay=|--query=|--delete=|--key=|--target=|--graphite=|--sync")
+	print(Colors.HEADER + "USAGE:" + Colors.ENDC + "$~" + script + " -w|-r|-f|-s|-c|-x|-q|-d|-k|-t|-g|-y")
+	print("\t-w -> switch | -s -> server | -r -> router | -f -> fexrouter |-c -> sdsl | -x -> device_hostname | -q -> query keyword | -d dashboard deletion keyword | -t Grafana server | -k Grafana API KEY | -g Graphite regex | -y sync files to Grafana public folder")
+	print("\n" + Colors.GREEN + "EXAMPLES:" + Colors.ENDC)
+	print(Colors.BLUE + "- Example to generate a dashboard for a given switch:" + "\n\t" + Colors.ENDC + "$~ " + script + " -w -x " + SWITCH_EXAMPLE)
+	print(Colors.BLUE + "- Example to generate a dashboard for a given CPE:" + "\n\t" + Colors.ENDC + "$~ " + script + " -c -x " + SDSL_EXAMPLE)
+	print(Colors.WARNING + "\t\tWarning: the device's hostname must be the same in Graphite-API" + Colors.ENDC)
+	print(Colors.BLUE + "- Example to generate dashboards for all routers:" + "\n\t" + Colors.ENDC + "$~ " + script + " -r" )
+	print(Colors.BLUE + "- Example to generate dashboards for all fexrouters:" + "\n\t" + Colors.ENDC + "$~ " + script + " -f" )
+	print(Colors.BLUE + "- Example to generate dashboards for all switches:" + "\n\t" + Colors.ENDC + "$~ " + script + " -w")
+	print(Colors.BLUE + "- Example to generate dashboards for all switches and sync them to Grafana public folder:" + "\n\t" + Colors.ENDC + "$~ " + script + " -w -y")
+	print(Colors.BLUE + "- Example to generate dashboards for all CPE devices:" + "\n\t" + Colors.ENDC + "$~ " + script + " -c")
+	print(Colors.BLUE + "- Example to list all dashboards" + "\n\t" + Colors.ENDC + "$~ " + script + " -q \" \"" )
+	print(Colors.BLUE + "- Example to delete all dashboards of which title contains the keyword: "+GRAPHITE_PREFIX+".switch:" + "\n\t" + Colors.ENDC + "$~ " + script + " -d "+GRAPHITE_PREFIX+".switch " )
+	print(Colors.WARNING + "\t\tan empty space keyword \" \" = all dashboards" + Colors.ENDC)
+	print(Colors.BLUE + "- Example to generate a dashboard for a given router, target and api key supplied" + "\n\t" + Colors.ENDC + "$~ " + script + " -r -x "+ROUTER_EXAMPLE+" -k " + GRAFANA_NETWORK_API_KEY + " -t " + GRAFANA_NETWORK_SERVER )
+	print(Colors.BLUE + "- Example to search Graphite backend with a Regex:" + "\n\t" + Colors.ENDC + "$~ " + script + " --graphite router.*")
+
+def main(argv):
+	""" Main definition """
+	DEVICE_TYPE = ""
+	DEVICE_HOSTNAME = ""
+	SEARCH_KEYWORD = None
+	SYNC = False
+	DO_DEVICE_DELETE = False
+	try:
+		opts, args = getopt.getopt(argv, "yg:t:k:hwrfcsx:d:q:", ["sync", "graphite=", "target=", "key=", "help", "switch", "router", "fexrouter","sdsl", "server", "xay=", "delete=", "query="])
+	except getopt.GetoptError:
+		usage()
+		sys.exit(2)
+
+	for opt, arg in opts:
+		if opt in ("-h", "--help"):
+			usage()
+			sys.exit()
+		elif opt in ("", '') or opt is None:
+			usage()
+			sys.exit(1)
+		elif opt in ("-w", "--switch"):
+			DEVICE_TYPE = "switch"
+		elif opt in ("-y", "--sync"):
+			SYNC = True
+		elif opt in ("-s", "--server"):
+			DEVICE_TYPE = "server"
+			print("TODO: Server support is not yet implemented")
+			sys.exit()
+		elif opt in ("-c", "--sdsl"):
+			DEVICE_TYPE = "sdsl"
+		elif opt in ("-k", "--key"):
+			global GRAFANA_API_KEY
+			GRAFANA_API_KEY = arg
+		elif opt in ("-g", "--graphite"):
+			global GRAPHITE_REGEX
+			GRAPHITE_REGEX = arg
+		elif opt in ("-t", "--target"):
+			global GRAFANA_TARGET_SERVER
+			GRAFANA_TARGET_SERVER = arg
+		elif opt in ("-r", "--router"):
+			DEVICE_TYPE = "router"
+		elif opt in ("-f", "--fexrouter"):
+			DEVICE_TYPE = "fexrouter"
+		elif opt in ("-x", "--xay"):
+			DEVICE_HOSTNAME = arg
+		elif opt in ("-q", "--query"):
+			SEARCH_KEYWORD = arg
+		elif opt in ("-d", "--delete"):
+			DO_DEVICE_DELETE = True
+			DELETE_KEYWORD = arg
+		else:
+			print("The option you want is not supported yet")
+			sys.exit()
+	source = "".join(args)
+
+	######################## FEED VARIABLES ##########################
+	set_config_values(GRAFANA_API_KEY, GRAFANA_TARGET_SERVER, SYNC)	
+
+	if not check_grafana_version():
+		print(Colors.FAIL + "Grafana must be running and Version must be at least 2.0. Also check your Grafana API KEY." + Colors.ENDC)
+		sys.exit(1)
+	
+	if SEARCH_KEYWORD is not None:	
+		try:
+			for slug in search_dashboards(SEARCH_KEYWORD):
+				print(slug)
+		except TypeError as e:
+			print(Colors.FAIL + "Please use \" \" instead of \"\" " + Colors.ENDC)
+		sys.exit()
+
+	if GRAPHITE_REGEX is not None and not GRAPHITE_REGEX == "":
+		for e in search_graphite(GRAPHITE_REGEX):
+			print(e)
+		sys.exit()
+
+	if DO_DEVICE_DELETE == True:
+		delete_dashboards(DELETE_KEYWORD)
+		sys.exit()
+
+	if not DEVICE_TYPE == "":
+		if DEVICE_TYPE == "router":
+			print("Please wait a while, it will take some time. be patient. I need to filter graphed interfaces for routers.")
+		post_dashboards_to_grafana(DEVICE_TYPE, DEVICE_HOSTNAME, SYNC)
+		print("")
+	else:
+		usage()
+		sys.exit()
+
+if __name__ == "__main__":
+	main(sys.argv[1:])
